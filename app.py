@@ -79,12 +79,17 @@ def serial_reader():
                         off = j * entry_size
                         # dist(u16), speed(i16), angle(i16), mag(u16)
                         d, s, a, m = struct.unpack_from('<HhhH', payload, off)
+                        
+                        target_id = j
+                        if header == "TDAT" and len(payload) >= off + 9:
+                            target_id = struct.unpack_from('B', payload, off + 8)[0]
+
                         targets.append({
                             'dist': d,
                             'speed': s / 100.0,
                             'angle': a / 100.0,
                             'mag': m / 100.0,
-                            'id': struct.unpack_from('B', payload, off + 8)[0] if header == "TDAT" else j
+                            'id': target_id
                         })
                     socketio.emit('targets', {'type': header, 'data': targets})
                 
@@ -158,6 +163,41 @@ def handle_update_setting(json):
             # Also request fresh data to confirm
             time.sleep(0.05)
             ser.write(build_kmd7_frame("GRPS"))
+
+
+@socketio.on('set_streams')
+def handle_set_streams(json):
+    """Receive a numeric 1-byte bitmask (or dict) from the GUI and send RDOT accordingly.
+    Expected numeric mapping (bit positions):
+      bit0 = RADC, bit1 = RFFT, bit2 = PDAT, bit3 = TDAT, bit5 = DONE
+    """
+    global ser
+    mask = None
+    if isinstance(json, dict):
+        mask = json.get('mask')
+    else:
+        mask = json
+
+    try:
+        mask_int = int(mask) & 0xFF
+    except Exception:
+        print(f"Invalid stream mask received: {json}")
+        return
+
+    if ser and ser.is_open:
+        try:
+            # STOP first to ensure clean state
+            ser.write(build_kmd7_frame("RDOT", b"\x00"))
+            time.sleep(0.05)
+            ser.reset_input_buffer()
+            
+            # Send new mask
+            ser.write(build_kmd7_frame("RDOT", bytes([mask_int])))
+            print(f"Sent RDOT with mask 0x{mask_int:02X}")
+        except Exception as e:
+            print(f"Failed sending RDOT: {e}")
+    else:
+        print(f"RDOT requested (0x{mask_int:02X}) but serial not open")
 
 @socketio.on('command')
 def handle_command(json):

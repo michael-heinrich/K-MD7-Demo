@@ -261,6 +261,23 @@ RDOT <bitmask>
 
 Sensor streams enabled messages every frame.
 
+**RDOT payload**
+
+- **Format:** 1 byte bitmask — binary coded bit-field where 0 = disabled, 1 = enabled.
+
+| Bit (MSB → LSB) | Bit # | Field | Description |
+|---:|:---:|:---|:---|
+| Reserved | 7 | X | Reserved / don't care |
+| Reserved | 6 | X | Reserved / don't care |
+| DONE | 5 | DONE | `DONE` message (4-byte frame number) |
+| Reserved | 4 | X | Reserved / don't care |
+| TDAT | 3 | TDAT | Tracked targets (`TDAT`) |
+| PDAT | 2 | PDAT | Raw targets (`PDAT`) |
+| RFFT | 1 | RFFT | FFT + threshold (`RFFT`) |
+| RADC | 0 | RADC | Raw ADC data (`RADC`) |
+
+Set a bit to `1` to enable its message; `0` disables it.
+
 ---
 
 # **11. Bootloader Protocol**
