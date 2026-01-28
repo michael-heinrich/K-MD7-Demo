@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K-MD7 Radar Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0b0e14; color: #e2e8f0; }
+        .radar-container { 
+            position: relative; 
+            width: 500px; 
+            height: 400px; 
+            background: #0b0e14;
+            overflow: hidden;
+            border-bottom: 2px solid #2d3748;
+        }
+        /* Cone/Wedge shape */
+        .fov-cone {
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle at center, rgba(72, 187, 120, 0.05) 0%, transparent 70%);
+            transform: translateX(-50%) translateY(50%) rotate(-30deg);
+            clip-path: polygon(50% 50%, 0% 0%, 100% 0%); /* Creates the triangle */
+            border-left: 1px solid rgba(72, 187, 120, 0.2);
+            border-right: 1px solid rgba(72, 187, 120, 0.2);
+            pointer-events: none;
+        }
+        .radar-grid {
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .grid-circle {
+            position: absolute;
+            border: 1px solid rgba(45, 55, 72, 0.5);
+            border-radius: 50%;
+            transform: translate(-50%, 50%);
+            bottom: 0;
+            left: 50%;
+        }
+        .target { 
+            position: absolute; 
+            width: 12px; 
+            height: 12px; 
+            background-color: #f56565; 
+            border-radius: 50%; 
+            transform: translate(-50%, -50%); 
+            box-shadow: 0 0 15px #f56565; 
+            transition: all 0.1s ease; 
+            z-index: 10;
+        }
+        .target-label {
+            position: absolute;
+            font-size: 10px;
+            color: #cbd5e0;
+            margin-top: -20px;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-7xl mx-auto">
+        <header class="flex justify-between items-center mb-8 border-b border-gray-800 pb-4">
+            <h1 class="text-3xl font-bold text-green-500 tracking-tight">K-MD7 <span class="text-gray-400 font-light text-xl">Radar Dashboard</span></h1>
+            <div id="status" class="px-3 py-1 bg-gray-800 rounded-full text-xs text-green-400 border border-green-900 shadow-[0_0_10px_rgba(72,187,120,0.2)]">CONNECTED</div>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <!-- Left: Radar View -->
+            <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800 flex flex-col items-center">
+                <div class="flex justify-between w-full mb-6">
+                    <h2 class="text-lg font-semibold text-gray-300">FOV Visualization (±30°)</h2>
+                    <span class="text-xs text-gray-500" id="frame-info">Waiting for data...</span>
+                </div>
+                <div class="radar-container mb-4" id="radar">
+                    <div class="fov-cone"></div>
+                    <div class="radar-grid">
+                        <div class="grid-circle" style="width: 200%; height: 200%;"></div>
+                        <div class="grid-circle" style="width: 150%; height: 150%;"></div>
+                        <div class="grid-circle" style="width: 100%; height: 100%;"></div>
+                        <div class="grid-circle" style="width: 50%; height: 50%;"></div>
+                        <!-- Angle grid lines -->
+                        <div class="absolute bottom-0 left-1/2 w-px h-full bg-gray-800 origin-bottom transform -rotate-30"></div>
+                        <div class="absolute bottom-0 left-1/2 w-px h-full bg-gray-800 origin-bottom transform rotate-30"></div>
+                        <div class="absolute bottom-0 left-1/2 w-px h-full bg-gray-700 origin-bottom"></div>
+                    </div>
+                </div>
+                <div class="flex justify-between w-full px-4 text-xs text-gray-500">
+                    <span>-30°</span>
+                    <span>0°</span>
+                    <span>+30°</span>
+                </div>
+            </div>
+
+            <!-- Right: FFT / Controls -->
+            <div class="space-y-8">
+                <!-- Spectrum Plot -->
+                <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-300">FFT Spectrum Analysis</h2>
+                    <canvas id="fftChart" height="200"></canvas>
+                </div>
+
+                <!-- Control Panel -->
+                <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-300">Sensor Controls</h2>
+                    <div class="grid grid-cols-2 gap-4">
+                        <button onclick="sendCmd('INIT', '00')" class="bg-gray-800 hover:bg-gray-700 text-white py-2 rounded-lg border border-gray-700 transition">RE-INIT</button>
+                        <button onclick="sendCmd('GRPS', '')" class="bg-gray-800 hover:bg-gray-700 text-white py-2 rounded-lg border border-gray-700 transition">REFRESH CONFIG</button>
+                        <button onclick="sendCmd('RDOT', '0C')" class="bg-green-900 hover:bg-green-800 text-green-100 py-2 rounded-lg border border-green-700 transition">ENABLE TRACKING</button>
+                        <button onclick="sendCmd('RDOT', '0E')" class="bg-blue-900 hover:bg-blue-800 text-blue-100 py-2 rounded-lg border border-blue-700 transition">ENABLE FFT + TRACK</button>
+                    </div>
+                </div>
+
+                <!-- Settings Configuration Panel -->
+                <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                    <h2 class="text-lg font-semibold mb-6 text-gray-300">Detailed Configuration</h2>
+                    <div class="grid grid-cols-2 gap-x-6 gap-y-4 text-sm" id="settings-form">
+                        <div>
+                            <label class="text-gray-500 block mb-1">Threshold Offset (dB)</label>
+                            <input type="range" min="0" max="60" id="cfg-thresh" onchange="updateCfg('thresh', this.value)" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer">
+                            <span class="text-xs text-green-500" id="val-thresh">--</span>
+                        </div>
+                        <div>
+                            <label class="text-gray-500 block mb-1">Frequency Channel</label>
+                            <select id="cfg-freq" onchange="updateCfg('freq', this.value)" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                                <option value="0">Low</option>
+                                <option value="1">Mid</option>
+                                <option value="2">High</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-gray-500 block mb-1">Range Setting</label>
+                            <select id="cfg-range" onchange="updateCfg('range', this.value)" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                                <option value="0">100m</option>
+                                <option value="1">200m</option>
+                                <option value="2">300m</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-gray-500 block mb-1">Detection Filter</label>
+                            <select id="cfg-dir" onchange="updateCfg('dir', this.value)" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                                <option value="0">Receding</option>
+                                <option value="1">Approaching</option>
+                                <option value="2">Both</option>
+                            </select>
+                        </div>
+                        <div class="col-span-2 grid grid-cols-2 gap-4 border-t border-gray-800 pt-4 mt-2">
+                            <div>
+                                <label class="text-gray-500 block text-xs uppercase">Min Distance (%)</label>
+                                <input type="number" id="cfg-min_dist" onchange="updateCfg('min_dist', this.value)" min="0" max="100" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                            </div>
+                            <div>
+                                <label class="text-gray-500 block text-xs uppercase">Max Distance (%)</label>
+                                <input type="number" id="cfg-max_dist" onchange="updateCfg('max_dist', this.value)" min="0" max="100" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                            </div>
+                            <div>
+                                <label class="text-gray-500 block text-xs uppercase">Min Angle (°)</label>
+                                <input type="number" id="cfg-min_ang" onchange="updateCfg('min_ang', this.value)" min="-30" max="30" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                            </div>
+                            <div>
+                                <label class="text-gray-500 block text-xs uppercase">Max Angle (°)</label>
+                                <input type="number" id="cfg-max_ang" onchange="updateCfg('max_ang', this.value)" min="-30" max="30" class="bg-gray-800 border-gray-700 text-gray-300 rounded p-1 w-full">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Target List -->
+        <div class="mt-8 bg-gray-900 rounded-2xl border border-gray-800 overflow-hidden">
+            <table class="w-full text-left">
+                <thead class="bg-gray-800 text-gray-400 text-xs uppercase tracking-wider">
+                    <tr>
+                        <th class="px-6 py-3">ID</th>
+                        <th class="px-6 py-3">Distance (m)</th>
+                        <th class="px-6 py-3">Speed (km/h)</th>
+                        <th class="px-6 py-3">Angle (°)</th>
+                        <th class="px-6 py-3">Magnitude (dB)</th>
+                    </tr>
+                </thead>
+                <tbody id="targetTable" class="divide-y divide-gray-800">
+                    <!-- Dynamic Rows -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        const radar = document.getElementById('radar');
+        const targetTable = document.getElementById('targetTable');
+        
+        // FFT Chart Init
+        const fftCtx = document.getElementById('fftChart').getContext('2d');
+        const fftChart = new Chart(fftCtx, {
+            type: 'line',
+            data: {
+                labels: Array.from({length: 512}, (_, i) => i),
+                datasets: [{
+                    label: 'Spectrum Intensity (dB)',
+                    data: [],
+                    borderColor: '#4299e1',
+                    borderWidth: 1,
+                    fill: true,
+                    backgroundColor: 'rgba(66, 153, 225, 0.1)',
+                    pointRadius: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: { min: 0, max: 100, grid: { color: '#2d3748' } },
+                    x: { grid: { display: false } }
+                },
+                animation: false
+            }
+        });
+
+        function sendCmd(cmd, payload) {
+            socket.emit('command', { cmd, payload });
+        }
+
+        function updateCfg(field, value) {
+            if (field === 'thresh') document.getElementById('val-thresh').innerText = `${value} dB`;
+            socket.emit('update_setting', { field, value });
+        }
+
+        socket.on('rpst', (msg) => {
+            console.log("Config received:", msg);
+            // Update UI fields
+            document.getElementById('cfg-thresh').value = msg.thresh;
+            document.getElementById('val-thresh').innerText = `${msg.thresh} dB`;
+            document.getElementById('cfg-freq').value = msg.freq;
+            document.getElementById('cfg-range').value = msg.range;
+            document.getElementById('cfg-dir').value = msg.dir;
+            document.getElementById('cfg-min_dist').value = msg.min_dist;
+            document.getElementById('cfg-max_dist').value = msg.max_dist;
+            document.getElementById('cfg-min_ang').value = msg.min_ang;
+            document.getElementById('cfg-max_ang').value = msg.max_ang;
+        });
+
+        socket.on('targets', (msg) => {
+            // Remove targets only
+            const oldTargets = radar.querySelectorAll('.target');
+            oldTargets.forEach(t => t.remove());
+            
+            targetTable.innerHTML = '';
+            document.getElementById('frame-info').innerText = `${msg.type} update: ${msg.data.length} targets`;
+            
+            // UI Params
+            const centerX = 250;
+            const centerY = 400;
+            const maxRangeCm = 3000;
+            const maxRangePx = 380;
+            
+            msg.data.forEach(t => {
+                // Visualization
+                const r = (t.dist / maxRangeCm) * maxRangePx;
+                const angleRad = t.angle * (Math.PI / 180);
+                
+                const x = centerX + r * Math.sin(angleRad);
+                const y = centerY - r * Math.cos(angleRad);
+                
+                if (t.dist <= maxRangeCm) {
+                    const el = document.createElement('div');
+                    el.className = 'target';
+                    el.style.left = `${x}px`;
+                    el.style.top = `${y}px`;
+                    
+                    const scale = 0.6 + (t.mag / 60); 
+                    el.style.transform = `translate(-50%, -50%) scale(${scale})`;
+                    
+                    // Add label
+                    const label = document.createElement('div');
+                    label.className = 'target-label';
+                    label.innerText = `${(t.dist/100).toFixed(1)}m / ${t.id}`;
+                    el.appendChild(label);
+                    
+                    radar.appendChild(el);
+                }
+
+                // Table update
+                const row = `<tr>
+                    <td class="px-6 py-3 font-mono text-green-500">${t.id}</td>
+                    <td class="px-6 py-3 font-medium">${(t.dist/100).toFixed(2)}</td>
+                    <td class="px-6 py-3 ${t.speed > 0 ? 'text-blue-400' : 'text-red-400'}">${t.speed.toFixed(1)}</td>
+                    <td class="px-6 py-3">${t.angle.toFixed(1)}°</td>
+                    <td class="px-6 py-3 text-gray-500">${t.mag.toFixed(1)}</td>
+                </tr>`;
+                targetTable.innerHTML += row;
+            });
+        });
+
+        socket.on('fft', (msg) => {
+            fftChart.data.datasets[0].data = msg.data;
+            fftChart.update();
+        });
+
+        socket.on('info', (msg) => {
+            console.log("Sensor Info:", msg.msg);
+        });
+    </script>
+</body>
+</html>
