@@ -78,6 +78,14 @@
             border: 2px solid rgba(255,255,255,0.6);
             border-radius: 50%;
         }
+        .kalman-target {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #6366f1;
+            background-color: rgba(99, 102, 241, 0.2) !important;
+            box-shadow: 0 0 20px #6366f1 !important;
+            z-index: 20;
+        }
         .target-label {
             position: absolute;
             font-size: 10px;
@@ -99,7 +107,15 @@
             <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800 flex flex-col items-center">
                 <div class="flex justify-between w-full mb-6">
                     <h2 class="text-lg font-semibold text-gray-300">FOV Visualization (±30°)</h2>
-                    <span class="text-xs text-gray-500" id="frame-info">Waiting for data...</span>
+                    <div class="flex items-center gap-2">
+                        <label class="text-xs text-gray-500">Scale:</label>
+                        <select id="dist-scale" onchange="updateScale()" class="bg-gray-800 text-gray-300 text-xs rounded border border-gray-700 p-1">
+                            <option value="linear">Linear</option>
+                            <option value="sqrt" selected>Square Root</option>
+                            <option value="log">Logarithmic</option>
+                        </select>
+                        <span class="text-xs text-gray-500 ml-4" id="frame-info">Waiting for data...</span>
+                    </div>
                 </div>
                 <div class="radar-container mb-4" id="radar">
                     <div class="fov-cone"></div>
@@ -120,6 +136,12 @@
 
             <!-- Right: FFT / Controls -->
             <div class="space-y-8">
+                <!-- Distance History Plot -->
+                <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                    <h2 class="text-lg font-semibold mb-4 text-gray-300">Distance History (60s)</h2>
+                    <canvas id="historyChart" height="200"></canvas>
+                </div>
+
                 <!-- Spectrum Plot -->
                 <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
                     <h2 class="text-lg font-semibold mb-4 text-gray-300">FFT Spectrum Analysis</h2>
@@ -232,7 +254,7 @@
         const gridContainer = document.getElementById('radar-grid-container');
         const targetTable = document.getElementById('targetTable');
         
-        let targetsCache = { 'PDAT': [], 'TDAT': [] };
+        let targetsCache = { 'PDAT': [], 'TDAT': [], 'KDAT': [] };
 
         // Configuration for non-linear scale
         const MAX_RANGE_CM = 30000; // 300 meters
@@ -240,13 +262,43 @@
         const CENTER_X = 250;
         const CENTER_Y = 400;
 
-        // Square root scaling function for compression at distance
+        let currentScaleMode = 'sqrt';
+
+        function updateScale() {
+            currentScaleMode = document.getElementById('dist-scale').value;
+            // Redraw grid
+            initGrid();
+            renderTargets();
+            // Update history chart Y axis
+            updateHistoryAxis();
+        }
+
+        // Scaling function for compression at distance
         function distToPx(distCm) {
-            return Math.sqrt(distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+            if (currentScaleMode === 'linear') {
+                return (distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+            } else if (currentScaleMode === 'sqrt') {
+                return Math.sqrt(distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+            } else if (currentScaleMode === 'log') {
+                // log(1+x) to avoid log(0)
+                const logMax = Math.log10(MAX_RANGE_CM + 1);
+                return (Math.log10(distCm + 1) / logMax) * MAX_RANGE_PX;
+            }
+            return (distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
         }
 
         function initGrid() {
-            const rings = [5, 10, 25, 50, 100, 200, 300]; // Meters
+            gridContainer.innerHTML = '';
+            // Re-add angle lines
+            const lines = [-30, 0, 30];
+            lines.forEach(ang => {
+                const l = document.createElement('div');
+                l.className = `absolute bottom-0 left-1/2 w-px h-full ${ang===0?'bg-gray-700':'bg-gray-800'} origin-bottom transform`;
+                l.style.transform = `translateX(-50%) rotate(${ang}deg)`;
+                gridContainer.appendChild(l);
+            });
+
+            const rings = [1, 5, 10, 25, 50, 100, 200, 300]; // Meters
             rings.forEach(m => {
                 const r = distToPx(m * 100);
                 const circle = document.createElement('div');
@@ -263,6 +315,107 @@
             });
         }
         initGrid();
+
+        // Distance History Chart
+        const historyCtx = document.getElementById('historyChart').getContext('2d');
+        const historyChart = new Chart(historyCtx, {
+            type: 'line',
+            data: {
+                datasets: []
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    x: { type: 'linear', position: 'bottom', min: -60000, max: 0, title: { display: true, text: 'Seconds ago', color: '#666' }, grid: { color: '#1a202c' } },
+                    y: { 
+                        min: 0, 
+                        max: MAX_RANGE_PX, 
+                        title: { display: true, text: 'Distance (meters)', color: '#666' },
+                        grid: { color: '#2d3748' },
+                        ticks: { 
+                            display: true,
+                            color: '#4a5568',
+                            font: { size: 10 }
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    }
+                },
+                animation: false,
+                elements: { point: { radius: 0 } }
+            }
+        });
+
+        function updateHistoryAxis() {
+            const rings = [1, 5, 10, 25, 50, 100, 200, 300];
+            historyChart.options.scales.y.max = MAX_RANGE_PX;
+            
+            // Force grid lines and ticks to match our meter rings
+            historyChart.options.scales.y.afterBuildTicks = (axis) => {
+                axis.ticks = rings.map(m => ({
+                    value: distToPx(m * 100),
+                    label: m + 'm'
+                }));
+            };
+            
+            historyChart.update();
+        }
+        updateHistoryAxis();
+
+        let historyData = {}; // track_id -> [{t, dist_px}]
+        const HISTORY_LIMIT_MS = 60000;
+
+        function updateHistory(type, data) {
+            if (!historyChart) return;
+            const now = Date.now();
+            
+            // Limit raw target history points to avoid performance issues
+            const maxPointsPerTrack = 500;
+
+            data.forEach(t => {
+                const id = type === 'KDAT' ? `KF-${t.id}` : (type === 'PDAT' ? `RAW-${t.id}` : `TRK-${t.id}`);
+                if (!historyData[id]) {
+                    historyData[id] = {
+                        label: id,
+                        borderColor: type === 'KDAT' ? '#6366f1' : (type === 'TDAT' ? '#48bb78' : 'rgba(245, 101, 101, 0.4)'),
+                        borderWidth: type === 'KDAT' || type === 'TDAT' ? 2 : 0,
+                        pointRadius: type === 'KDAT' || type === 'TDAT' ? 0 : 2,
+                        showLine: type === 'KDAT' || type === 'TDAT',
+                        fill: false,
+                        tension: 0.1,
+                        data: []
+                    };
+                }
+                historyData[id].data.push({ x: now, y: distToPx(t.dist) });
+                
+                if (historyData[id].data.length > maxPointsPerTrack) {
+                    historyData[id].data.shift();
+                }
+            });
+
+            // Cleanup old tracks and points
+            const deadline = now - HISTORY_LIMIT_MS;
+            Object.keys(historyData).forEach(id => {
+                historyData[id].data = historyData[id].data.filter(p => p.x > deadline);
+                if (historyData[id].data.length === 0) {
+                    delete historyData[id];
+                }
+            });
+
+            // Update datasets in Chart.js
+            const activeDatasets = Object.values(historyData);
+            historyChart.data.datasets = activeDatasets.map(d => {
+                return {
+                    ...d,
+                    data: d.data.map(p => ({ x: p.x - now, y: p.y }))
+                };
+            });
+
+            historyChart.update('none'); // Update without animation for performance
+        }
 
         // FFT Chart Init
         const fftCtx = document.getElementById('fftChart').getContext('2d');
@@ -333,6 +486,11 @@
         socket.on('targets', (msg) => {
             targetsCache[msg.type] = msg.data;
             renderTargets();
+            try {
+                updateHistory(msg.type, msg.data);
+            } catch (e) {
+                console.error("History update failed:", e);
+            }
         });
 
         function renderTargets() {
@@ -343,7 +501,7 @@
             targetTable.innerHTML = '';
             let totalCount = 0;
 
-            ['PDAT', 'TDAT'].forEach(type => {
+            ['PDAT', 'TDAT', 'KDAT'].forEach(type => {
                 const targets = targetsCache[type];
                 totalCount += targets.length;
 
@@ -356,16 +514,17 @@
                     const normalizedMag = Math.min(Math.max((magValue - minMag) / (maxMag - minMag), 0), 1);
                     
                     const hue = 220 - (normalizedMag * 220);
-                    const color = `hsl(${hue}, 95%, 50%)`;
+                    let color = `hsl(${hue}, 95%, 50%)`;
+                    if (type === 'KDAT') color = '#6366f1';
 
                     // Visualization
-                    const r = distToPx(t.dist);
-                    const angleRad = t.angle * (Math.PI / 180);
+                    const r = distToPx(t.dist || 0);
+                    const angleRad = (t.angle || 0) * (Math.PI / 180);
                     
                     const x = CENTER_X + r * Math.sin(angleRad);
                     const y = CENTER_Y - r * Math.cos(angleRad);
                     
-                    if (t.dist <= MAX_RANGE_CM) {
+                    if (t.dist !== undefined && t.dist <= MAX_RANGE_CM) {
                         const el = document.createElement('div');
                         el.classList.add('target');
                         
@@ -376,18 +535,20 @@
                             el.classList.add('raw-target');
                         } else if (type === 'TDAT') {
                             el.classList.add('tracked-target');
+                        } else if (type === 'KDAT') {
+                            el.classList.add('kalman-target');
                         }
                         el.style.left = `${x}px`;
                         el.style.top = `${y}px`;
                         
                         // We also scale by magnitude
-                        const scale = 0.6 + (t.mag / 60); 
+                        const scale = type === 'KDAT' ? 1.0 : (0.6 + (t.mag / 60)); 
                         el.style.transform = `translate(-50%, -50%) scale(${scale})`;
 
-                        if (type === 'TDAT') {
+                        if (type === 'TDAT' || type === 'KDAT') {
                             const label = document.createElement('div');
                             label.className = 'target-label';
-                            label.innerText = `${(t.dist/100).toFixed(1)}m / ${t.id}`;
+                            label.innerText = `${(t.dist/100).toFixed(1)}m / ${type === 'KDAT' ? 'KF-' : ''}${t.id}`;
                             el.appendChild(label);
                         }
                         radar.appendChild(el);
@@ -395,7 +556,7 @@
 
                     // Table update
                     const row = `<tr>
-                        <td class="px-6 py-3 font-mono ${type === 'TDAT' ? 'text-green-500' : 'text-blue-500'}">${type === 'TDAT' ? t.id : 'Raw ' + t.id}</td>
+                        <td class="px-6 py-3 font-mono ${type === 'TDAT' ? 'text-green-500' : (type === 'KDAT' ? 'text-indigo-400' : 'text-blue-500')}">${type === 'TDAT' ? t.id : (type === 'KDAT' ? 'KF ' + t.id : 'Raw ' + t.id)}</td>
                         <td class="px-6 py-3 font-medium">${(t.dist/100).toFixed(2)}</td>
                         <td class="px-6 py-3 ${t.speed > 0 ? 'text-blue-400' : 'text-red-400'}">${t.speed.toFixed(1)}</td>
                         <td class="px-6 py-3">${t.angle.toFixed(1)}°</td>

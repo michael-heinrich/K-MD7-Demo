@@ -3,8 +3,12 @@ import threading
 import time
 import struct
 import serial
+import math
+import csv
+from datetime import datetime
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
+from kalman_filter import Tracker
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
@@ -14,6 +18,71 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 ser = None
 PORT = "COM4"
 BAUD = 115200
+
+# CSV Logging Setup
+app_start_time = time.time()
+log_filename = f"radar_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+csv_header = ['timestamp_sec', 'epoch', 'distance_cm', 'angle_deg', 'velocity_m_s', 'magnitude_db']
+epoch_counter = 0
+
+def log_targets_to_csv(targets, epoch):
+    try:
+        with open(log_filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            timestamp = time.time() - app_start_time
+            for t in targets:
+                writer.writerow([
+                    f"{timestamp:.4f}",
+                    epoch,
+                    t['dist'],
+                    t['angle'],
+                    t['speed'],
+                    t['mag']
+                ])
+    except Exception as e:
+        print(f"CSV Logging Error: {e}")
+
+# Initialize CSV file with header
+with open(log_filename, mode='w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(csv_header)
+
+# Kalman Tracker
+tracker = Tracker(max_age=10, min_hits=3, distance_threshold=200) # threshold in cm (2m)
+last_track_time = time.time()
+last_pdat_time = time.time()
+
+def emit_kdat(tracked):
+    kdat = []
+    for trk in tracked:
+        # Convert back to polar for visualization compatibility
+        tdist = math.sqrt(trk['x']**2 + trk['y']**2)
+        tangle = math.degrees(math.atan2(trk['x'], trk['y']))
+        kdat.append({
+            'dist': tdist,
+            'angle': tangle,
+            'id': trk['id'],
+            'speed': math.sqrt(trk['vx']**2 + trk['vy']**2),
+            'mag': trk.get('mag', 70.0) # Use the real filtered magnitude
+        })
+    socketio.emit('targets', {'type': 'KDAT', 'data': kdat})
+
+def kalman_animator():
+    """Background thread to keep Kalman tracks moving between radar updates."""
+    global last_track_time, last_pdat_time
+    while True:
+        time.sleep(0.05)
+        now = time.time()
+        # If no PDAT for > 60ms, step the filter forward anyway
+        if now - last_pdat_time > 0.06:
+            dt = now - last_track_time
+            if dt > 0.01:
+                last_track_time = now
+                tracked = tracker.update([], dt)
+                emit_kdat(tracked)
+
+# Start animator thread
+threading.Thread(target=kalman_animator, daemon=True).start()
 
 # Cache the last parameter structure (31 bytes)
 current_rpst = bytearray([0]*31)
@@ -91,7 +160,34 @@ def serial_reader():
                             'mag': m / 100.0,
                             'id': target_id
                         })
+                    
+                    if header == "PDAT":
+                        global epoch_counter
+                        epoch_counter += 1
+                        log_targets_to_csv(targets, epoch_counter)
+
                     socketio.emit('targets', {'type': header, 'data': targets})
+
+                    # Kalman tracking for PDAT
+                    if header == "PDAT":
+                        global last_track_time, last_pdat_time
+                        now = time.time()
+                        dt = now - last_track_time
+                        last_track_time = now
+                        last_pdat_time = now
+
+                        measurements = []
+                        for t in targets:
+                            dist = t['dist']
+                            if dist > 3000: # Filter targets > 30 meters
+                                continue
+                                
+                            # Measurements are now passed as (range, angle, magnitude, speed)
+                            # for polar EKF processing
+                            measurements.append((float(dist), float(t['angle']), float(t['mag']), float(t['speed'] * 100.0)))
+                        
+                        tracked = tracker.update(measurements, dt)
+                        emit_kdat(tracked)
                 
                 elif header == "RFFT":
                     # Spectrum(512*u16) + Threshold(512*u16)
