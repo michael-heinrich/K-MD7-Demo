@@ -6,8 +6,9 @@ import serial
 import math
 import csv
 from datetime import datetime
-from flask import Flask, render_template
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
+from werkzeug.utils import secure_filename
 from kalman_filter import Tracker
 
 app = Flask(__name__)
@@ -21,7 +22,9 @@ BAUD = 115200
 
 # CSV Logging Setup
 app_start_time = time.time()
-log_filename = f"radar_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+logs_dir = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(logs_dir, exist_ok=True)
+log_filename = os.path.join(logs_dir, f"radar_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 csv_header = ['timestamp_sec', 'epoch', 'distance_cm', 'angle_deg', 'velocity_m_s', 'magnitude_db']
 epoch_counter = 0
 
@@ -314,6 +317,91 @@ def handle_command(json):
             print(f"Sent command: {cmd} with payload {payload_hex}")
         except Exception as e:
             print(f"Send Error: {e}")
+
+
+# --- Playback API and Page ---
+@app.route('/playback')
+def playback_page():
+    return render_template('playback.html')
+
+
+@app.route('/api/logs')
+def api_list_logs():
+    try:
+        files = [f for f in os.listdir(logs_dir) if f.lower().endswith('.csv')]
+        files.sort(reverse=True)
+        return jsonify({'files': files})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+
+@app.route('/api/log/<path:name>')
+def api_get_log(name):
+    # Prevent path traversal
+    filename = secure_filename(name)
+    file_path = os.path.join(logs_dir, filename)
+    print(f"[DEBUG] api_get_log requested name={name!r}, filename={filename!r}")
+    print(f"[DEBUG] resolved file_path={file_path!r}, exists={os.path.exists(file_path)}")
+    if os.path.commonpath([os.path.abspath(file_path), os.path.abspath(logs_dir)]) != os.path.abspath(logs_dir):
+        return jsonify({'error': 'invalid filename'}), 400
+
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'not found'}), 404
+
+    try:
+        epochs = {}
+        rows = []
+        with open(file_path, newline='') as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                # Expected columns: timestamp_sec, epoch, distance_cm, angle_deg, velocity_m_s, magnitude_db
+                try:
+                    ts = float(r.get('timestamp_sec', 0.0))
+                except Exception:
+                    ts = 0.0
+                try:
+                    epoch = int(r.get('epoch', 0))
+                except Exception:
+                    epoch = 0
+                try:
+                    dist = float(r.get('distance_cm', 0.0))
+                except Exception:
+                    dist = 0.0
+                try:
+                    angle = float(r.get('angle_deg', 0.0))
+                except Exception:
+                    angle = 0.0
+                try:
+                    vel = float(r.get('velocity_m_s', 0.0))
+                except Exception:
+                    vel = 0.0
+                try:
+                    mag = float(r.get('magnitude_db', 0.0))
+                except Exception:
+                    mag = 0.0
+
+                entry = {
+                    'timestamp_sec': ts,
+                    'epoch': epoch,
+                    'dist': dist,
+                    'angle': angle,
+                    'speed': vel,
+                    'mag': mag
+                }
+                rows.append(entry)
+                epochs.setdefault(epoch, {'timestamp_sec': ts, 'targets': []})['targets'].append(entry)
+
+        # Build ordered epoch list
+        epoch_list = []
+        for e in sorted(epochs.keys()):
+            epoch_list.append({'epoch': e, 'timestamp_sec': epochs[e].get('timestamp_sec', 0.0), 'targets': epochs[e]['targets']})
+
+        return jsonify({'rows': rows, 'epochs': epoch_list})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     # Start serial thread

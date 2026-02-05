@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Playback - Radar Logs</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0b0e14; color: #e2e8f0; }
+        .radar-container { 
+            position: relative; 
+            width: 500px; 
+            height: 400px; 
+            background: #0b0e14;
+            overflow: hidden;
+            border-bottom: 2px solid #2d3748;
+        }
+        .fov-cone {
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            width: 800px;
+            height: 800px;
+            background: radial-gradient(circle at center, rgba(72, 187, 120, 0.05) 0%, transparent 70%);
+            transform: translateX(-50%) translateY(50%);
+            clip-path: polygon(50% 50%, 21% 0%, 79% 0%);
+            border-left: 1px solid rgba(72, 187, 120, 0.2);
+            border-right: 1px solid rgba(72, 187, 120, 0.2);
+            pointer-events: none;
+        }
+        .radar-grid { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; height: 100%; pointer-events: none; }
+        .grid-circle { position: absolute; border: 1px solid rgba(45, 55, 72, 0.5); border-radius: 50%; transform: translate(-50%, 50%); bottom: 0; left: 50%; }
+        .grid-label { position: absolute; left: 50%; transform: translateX(-50%); color: #4a5568; font-size: 10px; pointer-events: none; }
+        .target { position: absolute; width: 12px; height: 12px; background-color: #f56565; border-radius: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 15px #f56565; transition: all 0.1s ease; z-index: 10; }
+        .raw-target { width: 8px; height: 8px; border-radius: 50%; }
+        .target-label { position: absolute; font-size: 10px; color: #cbd5e0; margin-top: -20px; white-space: nowrap; }
+    </style>
+</head>
+<body class="p-8">
+    <div class="max-w-7xl mx-auto">
+        <header class="flex justify-between items-center mb-8 border-b border-gray-800 pb-4">
+            <h1 class="text-2xl font-bold text-green-500 tracking-tight">Playback <span class="text-gray-400 font-light text-xl">Radar Logs</span></h1>
+            <a href="/" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 px-4 py-1.5 rounded-lg border border-gray-700 transition">Back to Live</a>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div class="col-span-2 bg-gray-900 p-6 rounded-2xl border border-gray-800 flex flex-col items-center">
+                <div class="flex justify-between w-full mb-6">
+                    <div class="flex items-center gap-3">
+                        <label class="text-sm text-gray-400">Log:</label>
+                        <select id="logSelect" class="bg-gray-800 text-gray-300 rounded p-2 text-sm"></select>
+                        <button id="loadBtn" class="bg-green-800 text-white px-3 py-1 rounded">Load</button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <label class="text-xs text-gray-500">Scale:</label>
+                        <select id="dist-scale" onchange="updateScale()" class="bg-gray-800 text-gray-300 text-xs rounded border border-gray-700 p-1">
+                            <option value="linear">Linear</option>
+                            <option value="sqrt" selected>Square Root</option>
+                            <option value="log">Logarithmic</option>
+                        </select>
+                        <span class="text-xs text-gray-500 ml-4" id="frame-info">Waiting for data...</span>
+                        <div class="ml-4">
+                            <button id="playBtn" class="bg-indigo-700 text-white px-3 py-1 rounded">Play</button>
+                            <button id="pauseBtn" class="bg-gray-700 text-white px-3 py-1 rounded">Pause</button>
+                            <label class="text-sm text-gray-400 ml-2">Speed:</label>
+                            <select id="speedSel" class="bg-gray-800 text-gray-300 rounded p-1 text-sm">
+                                <option value="1">1x</option>
+                                <option value="2">2x</option>
+                                <option value="4">4x</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="radar-container mb-4" id="radar">
+                    <div class="fov-cone"></div>
+                    <div id="radar-grid" class="radar-grid"></div>
+                </div>
+                <div class="flex justify-between text-xs text-gray-500 max-w-[500px]">
+                    <span>-30°</span>
+                    <span>0°</span>
+                    <span>+30°</span>
+                </div>
+
+                <div class="mt-6">
+                    <input type="range" id="timeSlider" min="0" max="0" value="0" class="w-full">
+                    <div class="flex justify-between text-sm text-gray-400 mt-2">
+                        <div id="timeLabel">Time: --</div>
+                        <div id="epochLabel">Epoch: --</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-gray-900 p-6 rounded-2xl border border-gray-800">
+                <h3 class="text-sm text-gray-300 mb-2">Frame Targets</h3>
+                <div id="targetList" class="text-sm text-gray-300"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const logsApi = '/api/logs';
+        const logSelect = document.getElementById('logSelect');
+        const loadBtn = document.getElementById('loadBtn');
+        const playBtn = document.getElementById('playBtn');
+        const pauseBtn = document.getElementById('pauseBtn');
+        const speedSel = document.getElementById('speedSel');
+        const timeSlider = document.getElementById('timeSlider');
+        const timeLabel = document.getElementById('timeLabel');
+        const epochLabel = document.getElementById('epochLabel');
+        const targetList = document.getElementById('targetList');
+        const radar = document.getElementById('radar');
+        const radarGrid = document.getElementById('radar-grid');
+
+        // Match live page scale and layout
+        const MAX_RANGE_CM = 30000; // 300 meters
+        const MAX_RANGE_PX = 380;
+        const CENTER_X = 250;
+        const CENTER_Y = 400;
+
+        let currentScaleMode = 'sqrt';
+
+        function distToPx(distCm) {
+            if (currentScaleMode === 'linear') {
+                return (distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+            } else if (currentScaleMode === 'sqrt') {
+                return Math.sqrt(distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+            } else if (currentScaleMode === 'log') {
+                const logMax = Math.log10(MAX_RANGE_CM + 1);
+                return (Math.log10(distCm + 1) / logMax) * MAX_RANGE_PX;
+            }
+            return (distCm / MAX_RANGE_CM) * MAX_RANGE_PX;
+        }
+
+        function updateScale() {
+            currentScaleMode = document.getElementById('dist-scale').value;
+            initGrid();
+            // re-render current frame
+            updateFrame(parseInt(timeSlider.value || 0));
+        }
+
+        function initGrid() {
+            radarGrid.innerHTML = '';
+            const lines = [-30, 0, 30];
+            lines.forEach(ang => {
+                const l = document.createElement('div');
+                l.className = `absolute bottom-0 left-1/2 w-px h-full ${ang===0?'bg-gray-700':'bg-gray-800'} origin-bottom transform`;
+                l.style.transform = `translateX(-50%) rotate(${ang}deg)`;
+                radarGrid.appendChild(l);
+            });
+
+            const rings = [1, 5, 10, 25, 50, 100, 200, 300];
+            rings.forEach(m => {
+                const r = distToPx(m * 100);
+                const circle = document.createElement('div');
+                circle.className = 'grid-circle';
+                circle.style.width = `${r * 2}px`;
+                circle.style.height = `${r * 2}px`;
+                radarGrid.appendChild(circle);
+
+                const label = document.createElement('div');
+                label.className = 'grid-label';
+                label.style.bottom = `${r - 5}px`;
+                label.innerText = `${m}m`;
+                radarGrid.appendChild(label);
+            });
+        }
+        initGrid();
+
+        async function loadLogList() {
+            const res = await fetch(logsApi);
+            const j = await res.json();
+            logSelect.innerHTML = '';
+            (j.files || []).forEach(f => {
+                const o = document.createElement('option');
+                o.value = f; o.innerText = f;
+                logSelect.appendChild(o);
+            });
+        }
+        loadLogList();
+
+        let currentEpochs = [];
+        let playInterval = null;
+
+        loadBtn.addEventListener('click', async () => {
+            const name = logSelect.value;
+            if (!name) return;
+            try {
+                const res = await fetch(`/api/log/${encodeURIComponent(name)}`);
+                if (!res.ok) {
+                    const text = await res.text();
+                    console.error('Failed loading log:', res.status, text);
+                    alert(`Failed to load log: ${res.status}`);
+                    return;
+                }
+                const j = await res.json();
+                currentEpochs = j.epochs || [];
+                timeSlider.min = 0;
+                timeSlider.max = Math.max(0, currentEpochs.length - 1);
+                timeSlider.value = 0;
+                updateFrame(0);
+            } catch (err) {
+                console.error('Error fetching log:', err);
+                alert('Error fetching log. See console for details.');
+            }
+        });
+
+        function renderFrame(frame) {
+            // clear previous targets
+            const old = radar.querySelectorAll('.target');
+            old.forEach(e => e.remove());
+            targetList.innerHTML = '';
+
+            if (!frame || !frame.targets) return;
+            let total = 0;
+            frame.targets.forEach(t => {
+                total++;
+                const magValue = parseFloat(t.mag) || 0;
+                const minMag = 20;
+                const maxMag = 80;
+                const normalizedMag = Math.min(Math.max((magValue - minMag) / (maxMag - minMag), 0), 1);
+                const hue = 220 - (normalizedMag * 220);
+                const color = `hsl(${hue}, 95%, 50%)`;
+
+                const r = distToPx(t.dist || 0);
+                const ang = (t.angle || 0) * Math.PI / 180;
+                const x = CENTER_X + r * Math.sin(ang);
+                const y = CENTER_Y - r * Math.cos(ang);
+
+                if (t.dist !== undefined && t.dist <= MAX_RANGE_CM) {
+                    const el = document.createElement('div');
+                    el.classList.add('target','raw-target');
+                    el.style.backgroundColor = color;
+                    el.style.boxShadow = `0 0 ${8 + normalizedMag * 15}px ${color}`;
+                    el.style.left = `${x}px`;
+                    el.style.top = `${y}px`;
+                    const scale = 0.6 + (t.mag / 60);
+                    el.style.transform = `translate(-50%, -50%) scale(${scale})`;
+
+                    const label = document.createElement('div');
+                    label.className = 'target-label';
+                    label.innerText = `${(t.dist/100).toFixed(1)}m`;
+                    el.appendChild(label);
+
+                    radar.appendChild(el);
+                }
+
+                const row = document.createElement('div');
+                row.innerHTML = `Epoch ${frame.epoch} • ${(t.dist/100).toFixed(2)} m • ${t.angle.toFixed(1)}° • <span style="color:${color}">${t.mag.toFixed(1)} dB</span>`;
+                targetList.appendChild(row);
+            });
+            document.getElementById('frame-info').innerText = `Displaying ${total} targets`;
+        }
+
+        function updateFrame(idx) {
+            idx = Math.max(0, Math.min(idx, currentEpochs.length - 1));
+            timeSlider.value = idx;
+            const frm = currentEpochs[idx];
+            if (!frm) return;
+            const ts = frm.timestamp_sec;
+            timeLabel.innerText = `Time: ${ts.toFixed(3)}s`;
+            epochLabel.innerText = `Epoch: ${frm.epoch}`;
+            renderFrame(frm);
+        }
+
+        timeSlider.addEventListener('input', (e) => {
+            updateFrame(parseInt(e.target.value));
+        });
+
+        playBtn.addEventListener('click', () => {
+            if (playInterval) return;
+            let speed = parseInt(speedSel.value) || 1;
+            playInterval = setInterval(() => {
+                let v = parseInt(timeSlider.value);
+                v++;
+                if (v > timeSlider.max) { clearInterval(playInterval); playInterval = null; return; }
+                updateFrame(v);
+            }, 200 / speed);
+        });
+        pauseBtn.addEventListener('click', () => {
+            if (playInterval) { clearInterval(playInterval); playInterval = null; }
+        });
+    </script>
+</body>
+</html>
