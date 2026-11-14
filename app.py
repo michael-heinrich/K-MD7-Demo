@@ -3,8 +3,10 @@ import threading
 import time
 import struct
 import serial
+from serial.tools import list_ports
 import math
 import csv
+import traceback
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
@@ -17,8 +19,29 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Global state
 ser = None
-PORT = "COM4"
+# Set KMD7_PORT to restrict discovery to a specific serial port.
+PORT = os.environ.get("KMD7_PORT")
 BAUD = 115200
+RETRY_INTERVAL = 5
+HANDSHAKE_TIMEOUT = 2
+IDLE_TIMEOUT = 10
+PROBE_TIMEOUT = 3
+stream_mask = 0x0C
+connection_status = {'state': 'disconnected', 'port': None, 'message': 'Waiting for radar discovery'}
+serial_lock = threading.RLock()
+
+
+def set_connection_status(state, message, port=None):
+    global connection_status
+    connection_status = {'state': state, 'port': port, 'message': message}
+    print(f"[Radar] {message}", flush=True)
+    socketio.emit('radar_status', connection_status)
+
+
+@socketio.on('connect')
+def handle_connect():
+    emit('radar_status', connection_status)
+
 
 # CSV Logging Setup
 app_start_time = time.time()
@@ -88,61 +111,143 @@ def kalman_animator():
 threading.Thread(target=kalman_animator, daemon=True).start()
 
 # Cache the last parameter structure (31 bytes)
-current_rpst = bytearray([0]*31)
+current_rpst = None
 
 def build_kmd7_frame(cmd: str, payload: bytes = b'') -> bytes:
     header = cmd.encode('ascii')[:4].ljust(4, b' ')
     length = struct.pack('<I', len(payload))
     return header + length + payload
 
+# Only accept known sensor messages, with protocol-defined payload bounds. This
+# also allows recovery when a serial stream begins in the middle of a frame.
+FRAME_LENGTHS = {
+    'RESP': (1, 1), 'VERS': (1, 19), 'RPST': (31, 31),
+    'PDAT': (0, 192), 'TDAT': (0, 72), 'RADC': (6144, 6144),
+    'RFFT': (2048, 2048), 'DONE': (4, 4),
+}
+RESPONSE_CODES = {0: 'OK', 1: 'unknown command', 2: 'invalid parameter',
+                  3: 'invalid RPST version', 4: 'UART error',
+                  5: 'missing calibration', 6: 'timeout', 7: 'application corrupt'}
+
+
 def parse_frames(buf: bytearray):
     i = 0
     while i + 8 <= len(buf):
-        hdr_bytes = buf[i:i+4]
-        if all(32 <= b <= 126 for b in hdr_bytes):
-            payload_len = struct.unpack('<I', buf[i+4:i+8])[0]
-            if payload_len > 200000:
-                i += 1
-                continue
-            if i + 8 + payload_len <= len(buf):
-                header = hdr_bytes.decode('ascii', errors='replace')
-                payload = bytes(buf[i+8 : i+8+payload_len])
-                del buf[:i + 8 + payload_len]
-                return header, payload
-            else:
-                break
-        i += 1
+        try:
+            header = bytes(buf[i:i + 4]).decode('ascii')
+        except UnicodeDecodeError:
+            i += 1
+            continue
+        bounds = FRAME_LENGTHS.get(header)
+        payload_len = struct.unpack_from('<I', buf, i + 4)[0]
+        if not bounds or not bounds[0] <= payload_len <= bounds[1]:
+            i += 1
+            continue
+        if i + 8 + payload_len > len(buf):
+            if i:
+                del buf[:i]
+            return None, None
+        payload = bytes(buf[i + 8:i + 8 + payload_len])
+        del buf[:i + 8 + payload_len]
+        return header, payload
+    if i:
+        del buf[:i]
     return None, None
 
-def serial_reader():
-    global ser
-    print(f"Connecting to K-MD7 on {PORT}...")
-    try:
-        ser = serial.Serial(PORT, BAUD, parity=serial.PARITY_EVEN, timeout=0.1)
-        # Init
-        ser.write(build_kmd7_frame("INIT", b"\x00"))
-        time.sleep(0.1)
-        # Request initial config state
-        ser.write(build_kmd7_frame("GRPS"))
-        time.sleep(0.1)
-        # Enable targets by default
-        ser.write(build_kmd7_frame("RDOT", b"\x0C"))
-    except Exception as e:
-        print(f"Serial Error: {e}")
-        return
 
-    buf = bytearray()
+def discover_radar():
+    """Open and initialize each candidate until a radar acknowledges INIT."""
+    if PORT:
+        candidates = [PORT]
+    else:
+        try:
+            candidates = [p.device for p in sorted(list_ports.comports(), key=lambda p: p.device)]
+        except (serial.SerialException, OSError) as exc:
+            set_connection_status('disconnected', f"Could not list serial ports: {exc}; retrying in 5 seconds.")
+            return None, bytearray()
+    if not candidates:
+        set_connection_status('disconnected', 'No serial ports found; retrying in 5 seconds.')
+        return None, bytearray()
+    set_connection_status('searching', f"Searching serial ports: {', '.join(candidates)}")
+    for port in candidates:
+        candidate = None
+        try:
+            print(f"[Radar] Trying {port} (115200 8E1): sending INIT", flush=True)
+            candidate = serial.Serial(port, BAUD, parity=serial.PARITY_EVEN,
+                                      timeout=0.1, write_timeout=1)
+            candidate.write(build_kmd7_frame('INIT', b'\x00'))
+            deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+            buf = bytearray()
+            while time.monotonic() < deadline:
+                data = candidate.read(candidate.in_waiting or 1)
+                if data:
+                    buf.extend(data)
+                while True:
+                    header, payload = parse_frames(buf)
+                    if header is None:
+                        break
+                    if header == 'VERS':
+                        print(f"[Radar] {port} firmware: {payload.split(bytes([0]), 1)[0].decode('ascii', errors='replace')}", flush=True)
+                    if header == 'RESP':
+                        code = payload[0]
+                        if code != 0:
+                            raise RuntimeError(f"INIT rejected: RESP {code} ({RESPONSE_CODES.get(code, 'unknown error')})")
+                        print(f"[Radar] {port} acknowledged INIT (RESP 0).", flush=True)
+                        return candidate, buf
+            print(f"[Radar] {port}: no INIT acknowledgement within {HANDSHAKE_TIMEOUT}s.", flush=True)
+        except (serial.SerialException, OSError, RuntimeError) as exc:
+            print(f"[Radar] {port}: connection failed: {exc}", flush=True)
+        if candidate is not None:
+            candidate.close()
+    set_connection_status('disconnected', 'No radar acknowledged INIT; retrying in 5 seconds.')
+    return None, bytearray()
+
+
+def serial_reader():
+    global ser, current_rpst
+    while True:
+        candidate, buf = discover_radar()
+        if candidate is None:
+            time.sleep(RETRY_INTERVAL)
+            continue
+        try:
+            # Publish the port only after the INIT acknowledgement has been verified.
+            with serial_lock:
+                current_rpst = None
+                ser = candidate
+                candidate.write(build_kmd7_frame("GRPS"))
+                candidate.write(build_kmd7_frame("RDOT", bytes([stream_mask])))
+            set_connection_status('connected', f"Connected to radar on {candidate.port}; requested settings and target stream.", candidate.port)
+            read_radar(candidate, buf)
+        except (serial.SerialException, OSError) as exc:
+            set_connection_status('disconnected', f"Connection to {candidate.port} lost: {exc}; retrying in 5 seconds.")
+        except Exception as exc:
+            traceback.print_exc()
+            set_connection_status('disconnected', f"Radar reader failed: {exc}; retrying in 5 seconds.")
+        finally:
+            with serial_lock:
+                if ser is candidate:
+                    ser = None
+                candidate.close()
+        time.sleep(RETRY_INTERVAL)
+
+
+def read_radar(connection, buf):
+    last_frame = time.monotonic()
+    probe_sent = None
     while True:
         try:
-            if ser.in_waiting:
-                data = ser.read(ser.in_waiting)
+            if connection.in_waiting:
+                data = connection.read(connection.in_waiting)
                 buf.extend(data)
             
             while True:
                 header, payload = parse_frames(buf)
                 if not header:
                     break
-                
+                last_frame = time.monotonic()
+                probe_sent = None
+
                 if header in ("PDAT", "TDAT"):
                     entry_size = 8 if header == "PDAT" else 9
                     count = len(payload) // entry_size
@@ -222,11 +327,25 @@ def serial_reader():
                         })
                 
                 elif header == "RESP":
-                    socketio.emit('info', {'msg': f"Sensor Response: {payload[0] if payload else '?'}"})
+                    code = payload[0]
+                    message = f"Sensor response: {code} ({RESPONSE_CODES.get(code, 'unknown error')})"
+                    print(f"[Radar] {message}", flush=True)
+                    socketio.emit('info', {'msg': message})
+                elif header == "VERS":
+                    firmware = payload.split(b'\x00', 1)[0].decode('ascii', errors='replace')
+                    print(f"[Radar] Firmware: {firmware}", flush=True)
 
-        except Exception as e:
-            print(f"Reader Loop Error: {e}")
-            break
+            now = time.monotonic()
+            if probe_sent is not None and now - probe_sent > PROBE_TIMEOUT:
+                raise serial.SerialException('sensor stopped responding to GRPS')
+            if probe_sent is None and now - last_frame > IDLE_TIMEOUT:
+                print(f"[Radar] No frames for {IDLE_TIMEOUT}s on {connection.port}; checking connection with GRPS.", flush=True)
+                with serial_lock:
+                    connection.write(build_kmd7_frame('GRPS'))
+                probe_sent = now
+
+        except (serial.SerialException, OSError):
+            raise
         time.sleep(0.01)
 
 @app.route('/')
@@ -247,21 +366,24 @@ def handle_update_setting(json):
         'max_speed': 29, 'dir': 30
     }
     
-    if field in offsets:
+    if field not in offsets:
+        return
+    with serial_lock:
+        if not ser or not ser.is_open:
+            print(f"[Radar] Cannot update {field}: radar is not connected.", flush=True)
+            return
+        if current_rpst is None:
+            print(f"[Radar] Cannot update {field}: waiting for sensor settings (RPST).", flush=True)
+            return
         idx = offsets[field]
-        # Handle signed bytes for angles if needed, but struct pack 'b' or simple byte assignment works for -30..30
-        if field in ('min_ang', 'max_ang'):
-            current_rpst[idx] = struct.pack('b', value)[0]
-        else:
-            current_rpst[idx] = value & 0xFF
-        
-        if ser and ser.is_open:
-            # Send updated structure
-            ser.write(build_kmd7_frame("SRPS", bytes(current_rpst)))
-            print(f"Updated setting {field} to {value}, sent SRPS")
-            # Also request fresh data to confirm
-            time.sleep(0.05)
+        updated = bytearray(current_rpst)
+        updated[idx] = struct.pack('b', value)[0] if field in ('min_ang', 'max_ang') else value & 0xFF
+        try:
+            ser.write(build_kmd7_frame("SRPS", bytes(updated)))
             ser.write(build_kmd7_frame("GRPS"))
+            print(f"[Radar] Sent setting {field}={value}; awaiting sensor response.", flush=True)
+        except (serial.SerialException, OSError) as exc:
+            print(f"[Radar] Failed to update {field}: {exc}", flush=True)
 
 
 @socketio.on('set_streams')
@@ -270,53 +392,39 @@ def handle_set_streams(json):
     Expected numeric mapping (bit positions):
       bit0 = RADC, bit1 = RFFT, bit2 = PDAT, bit3 = TDAT, bit5 = DONE
     """
-    global ser
-    mask = None
-    if isinstance(json, dict):
-        mask = json.get('mask')
-    else:
-        mask = json
-
+    global stream_mask
+    mask = json.get('mask') if isinstance(json, dict) else json
     try:
         mask_int = int(mask) & 0xFF
-    except Exception:
-        print(f"Invalid stream mask received: {json}")
+    except (TypeError, ValueError):
+        print(f"[Radar] Invalid stream mask: {json}", flush=True)
         return
-
-    if ser and ser.is_open:
+    with serial_lock:
+        stream_mask = mask_int
+        if not ser or not ser.is_open:
+            print(f"[Radar] Stream mask 0x{mask_int:02X} saved for the next connection.", flush=True)
+            return
         try:
-            # STOP first to ensure clean state
-            ser.write(build_kmd7_frame("RDOT", b"\x00"))
-            time.sleep(0.05)
-            ser.reset_input_buffer()
-            
-            # Send new mask
             ser.write(build_kmd7_frame("RDOT", bytes([mask_int])))
-            print(f"Sent RDOT with mask 0x{mask_int:02X}")
-        except Exception as e:
-            print(f"Failed sending RDOT: {e}")
-    else:
-        print(f"RDOT requested (0x{mask_int:02X}) but serial not open")
+            print(f"[Radar] Sent RDOT 0x{mask_int:02X}; awaiting sensor response.", flush=True)
+        except (serial.SerialException, OSError) as exc:
+            print(f"[Radar] Failed to send RDOT: {exc}", flush=True)
+
 
 @socketio.on('command')
 def handle_command(json):
-    global ser
     cmd = json.get('cmd')
     payload_hex = json.get('payload', '')
-    if ser and ser.is_open:
+    with serial_lock:
+        if not ser or not ser.is_open:
+            print(f"[Radar] Cannot send {cmd}: radar is not connected.", flush=True)
+            return
         try:
-            # For mode switching (RDOT), let's ensure we stop first
-            if cmd == "RDOT" and payload_hex != "00":
-                ser.write(build_kmd7_frame("RDOT", b"\x00"))
-                time.sleep(0.05)
-                # clear buffers
-                ser.reset_input_buffer()
-            
             payload = bytes.fromhex(payload_hex)
             ser.write(build_kmd7_frame(cmd, payload))
-            print(f"Sent command: {cmd} with payload {payload_hex}")
-        except Exception as e:
-            print(f"Send Error: {e}")
+            print(f"[Radar] Sent {cmd} {payload_hex}; awaiting sensor response.", flush=True)
+        except (serial.SerialException, OSError, ValueError, TypeError, AttributeError) as exc:
+            print(f"[Radar] Failed to send {cmd}: {exc}", flush=True)
 
 
 # --- Playback API and Page ---

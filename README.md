@@ -12,6 +12,17 @@ Copy and paste this into PowerShell to start the real-time visualization:
 
 Then open your browser to: [http://127.0.0.1:5000](http://127.0.0.1:5000)
 
+The dashboard scans available serial ports at 115200 baud, 8E1, and considers a radar connected only after it acknowledges `INIT`. The terminal reports each port tried, errors, sensor responses, and reconnection attempts. The dashboard status shows whether the radar is searching, connected, or disconnected. If the device is connected later or unplugged, the app retries automatically.
+
+Discovery sends an `INIT` frame to each available serial port. To probe only a known port instead (for example, COM5), set an environment variable before starting the app:
+
+```powershell
+$env:KMD7_PORT = "COM5"
+python app.py
+```
+
+Remove the override with `Remove-Item Env:KMD7_PORT` to resume automatic discovery. If a port cannot be opened, check that no other application is using it; if it opens but does not acknowledge `INIT`, check power, cabling, and the serial settings.
+
 ## 📡 CLI Scanner
 
 If you just want to see the closest target in your terminal:
@@ -26,7 +37,7 @@ If you haven't installed dependencies yet (PowerShell):
 
 ```powershell
 .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 Examples:

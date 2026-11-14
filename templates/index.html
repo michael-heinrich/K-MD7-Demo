@@ -101,7 +101,7 @@
             <h1 class="text-3xl font-bold text-green-500 tracking-tight">K-MD7 <span class="text-gray-400 font-light text-xl">Radar Dashboard</span></h1>
             <div class="flex items-center gap-4">
                 <a href="/playback" class="text-sm bg-gray-800 hover:bg-gray-700 text-gray-300 px-4 py-1.5 rounded-lg border border-gray-700 transition">View Logs</a>
-                <div id="status" class="px-3 py-1 bg-gray-800 rounded-full text-xs text-green-400 border border-green-900 shadow-[0_0_10px_rgba(72,187,120,0.2)]">CONNECTED</div>
+                <div id="status" class="px-3 py-1 bg-gray-800 rounded-full text-xs text-yellow-400 border border-gray-700" role="status">CONNECTING TO SERVER</div>
             </div>
         </header>
 
@@ -472,6 +472,31 @@
             socket.emit('update_setting', { field, value });
         }
 
+        let radarConnected = false;
+        const status = document.getElementById('status');
+        socket.on('radar_status', (msg) => {
+            radarConnected = msg.state === 'connected';
+            status.textContent = msg.state === 'connected' ? `RADAR CONNECTED: ${msg.port}` :
+                msg.state === 'searching' ? 'SEARCHING FOR RADAR' : 'RADAR DISCONNECTED';
+            status.title = msg.message;
+            status.className = 'px-3 py-1 bg-gray-800 rounded-full text-xs border border-gray-700 ' +
+                (msg.state === 'connected' ? 'text-green-400' : msg.state === 'searching' ? 'text-yellow-400' : 'text-red-400');
+            if (msg.state === 'disconnected') {
+                targetsCache = { 'PDAT': [], 'TDAT': [], 'KDAT': [] };
+                renderTargets();
+                document.getElementById('frame-info').innerText = msg.message;
+            }
+        });
+        socket.on('disconnect', () => {
+            radarConnected = false;
+            status.textContent = 'SERVER DISCONNECTED';
+            status.title = 'Connection to the dashboard server was lost.';
+            status.className = 'px-3 py-1 bg-gray-800 rounded-full text-xs border border-gray-700 text-red-400';
+            targetsCache = { 'PDAT': [], 'TDAT': [], 'KDAT': [] };
+            renderTargets();
+            document.getElementById('frame-info').innerText = 'Connection to the dashboard server was lost.';
+        });
+
         socket.on('rpst', (msg) => {
             console.log("Config received:", msg);
             // Update UI fields
@@ -487,6 +512,7 @@
         });
 
         socket.on('targets', (msg) => {
+            if (!radarConnected) return;
             targetsCache[msg.type] = msg.data;
             renderTargets();
             try {
